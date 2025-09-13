@@ -1,446 +1,375 @@
-# cipher_system.py
+# cipher_system.py - Chaotic Video Encryption Pipeline
 import hashlib
 import hmac
 import struct
-import zlib
 import numpy as np
-from typing import Tuple, List, Optional, Union
+from typing import Tuple, List
+from scipy.fft import dct, idct
 
 
-def load_pool_bytes(filename: str) -> bytes:
-    """Load pre-generated Lorenz pool bytes"""
-    with open(filename, 'rb') as f:
-        return f.read()
-
-
-def derive_seed_hash(frame_no: int, salt: bytes) -> bytes:
-    """Derive seed hash from frame number and salt"""
-    data = struct.pack('>Q', frame_no) + salt
+def derive_seed_hash(frame_no: int, salt: bytes, final_lorenz_state: Tuple[float, float, float] = None) -> bytes:
+    """Derive seed hash using Lorenz final state + frame number + salt"""
+    if final_lorenz_state is None:
+        # Default final state if not provided
+        final_lorenz_state = (1.0, 1.0, 1.0)
+    
+    x, y, z = final_lorenz_state
+    # Pack Lorenz state and frame number
+    lorenz_bytes = struct.pack('>ddd', x, y, z)  # double precision
+    frame_bytes = struct.pack('>Q', frame_no)
+    
+    # SHA256(X_last || Y_last || Z_last || f || SALT)
+    data = lorenz_bytes + frame_bytes + salt
     return hashlib.sha256(data).digest()
 
 
 def get_pool_offset(seed_hash: bytes, pool_size: int) -> int:
-    """Get deterministic offset into pool bytes"""
+    """Get deterministic offset into chaos pool"""
     hash_int = struct.unpack('>Q', seed_hash[:8])[0]
-    return hash_int % (pool_size - 10000)  # Ensure enough bytes available
+    return hash_int % (pool_size - 10000)  # Leave safety margin
 
 
-def build_sbox(pool_bytes: bytes, offset: int) -> Tuple[List[int], List[int]]:
-    """Build bijective S-box using Fisher-Yates shuffle"""
+def build_sbox_from_chaos(pool_bytes: bytes, offset: int) -> Tuple[List[int], List[int]]:
+    """Build bijective S-box using Fisher-Yates shuffle with chaotic bytes"""
     sbox = list(range(256))
-    inv_sbox = [0] * 256
     
-    # Use pool bytes as random source for Fisher-Yates
+    # Fisher-Yates shuffle using chaotic bytes
     for i in range(255, 0, -1):
-        j = pool_bytes[offset + (255 - i)] % (i + 1)
-        sbox[i], sbox[j] = sbox[j], sbox[i]
+        if offset + (255 - i) < len(pool_bytes):
+            chaos_byte = pool_bytes[offset + (255 - i)]
+            j = chaos_byte % (i + 1)
+            sbox[i], sbox[j] = sbox[j], sbox[i]
     
     # Build inverse S-box
+    inv_sbox = [0] * 256
     for i in range(256):
         inv_sbox[sbox[i]] = i
     
     return sbox, inv_sbox
 
 
-def build_permutation(pool_bytes: bytes, offset: int, size: int) -> Tuple[np.ndarray, np.ndarray]:
-    """Build permutation using Fisher-Yates shuffle"""
+def build_permutation_from_chaos(pool_bytes: bytes, offset: int, size: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Build permutation using Fisher-Yates with chaotic bytes"""
     perm = np.arange(size)
     
     # Fisher-Yates shuffle
     for i in range(size - 1, 0, -1):
         if offset + (size - 1 - i) < len(pool_bytes):
-            j = pool_bytes[offset + (size - 1 - i)] % (i + 1)
+            chaos_byte = pool_bytes[offset + (size - 1 - i)]
+            j = chaos_byte % (i + 1)
             perm[i], perm[j] = perm[j], perm[i]
     
     # Build inverse permutation
     inv_perm = np.argsort(perm)
-    
     return perm, inv_perm
 
 
-def generate_keystream(seed: bytes, length: int) -> bytes:
-    """Generate keystream using SHA256 chaining"""
+def generate_chaotic_keystream(pool_bytes: bytes, offset: int, length: int) -> bytes:
+    """Generate keystream from chaotic pool"""
     keystream = bytearray()
-    current = seed
     
-    while len(keystream) < length:
-        current = hashlib.sha256(current).digest()
-        keystream.extend(current)
+    # Use chaotic bytes directly, wrapping around if needed
+    for i in range(length):
+        idx = (offset + i) % len(pool_bytes)
+        keystream.append(pool_bytes[idx])
     
-    return bytes(keystream[:length])
+    return bytes(keystream)
 
-
-# ============================
-# VIDEO ENCRYPTION PIPELINE (2D SPATIAL)
-# ============================
 
 class VideoChaoticCipher:
-    """2D Spatial Video Encryption using Chaotic Lorenz Pool"""
+    """Complete chaotic video encryption pipeline following specified stages"""
     
     def __init__(self, pool_bytes: bytes):
         self.pool_bytes = pool_bytes
         self.pool_size = len(pool_bytes)
     
-    def _apply_block_permutation(self, frame: np.ndarray, perm: np.ndarray) -> np.ndarray:
-        """Apply block-level permutation to video frame"""
-        height, width, channels = frame.shape
-        block_height = max(1, height // 8)  # 8x8 blocks
-        block_width = max(1, width // 8)
-        
-        # Create blocks
-        blocks = []
-        for i in range(0, height, block_height):
-            for j in range(0, width, block_width):
-                block = frame[i:i+block_height, j:j+block_width]
-                blocks.append(block)
-        
-        # Permute blocks
-        if len(blocks) > 1 and len(perm) >= len(blocks):
-            perm_blocks = [blocks[perm[i] % len(blocks)] for i in range(len(blocks))]
-        else:
-            perm_blocks = blocks
-        
-        # Reconstruct frame
-        result = np.zeros_like(frame)
-        idx = 0
-        for i in range(0, height, block_height):
-            for j in range(0, width, block_width):
-                if idx < len(perm_blocks):
-                    block = perm_blocks[idx]
-                    h_end = min(i + block.shape[0], height)
-                    w_end = min(j + block.shape[1], width)
-                    result[i:h_end, j:w_end] = block[:h_end-i, :w_end-j]
-                    idx += 1
-        
-        return result
-    
-    def _apply_pixel_permutation(self, block: np.ndarray, perm: np.ndarray) -> np.ndarray:
-        """Apply pixel-level permutation within blocks"""
-        shape = block.shape
-        flat = block.flatten()
-        
-        if len(perm) >= len(flat):
-            perm_indices = perm[:len(flat)]
-            permuted_flat = flat[perm_indices]
-        else:
-            permuted_flat = flat
-        
-        return permuted_flat.reshape(shape)
-    
     def encrypt_frame(self, frame_bytes: bytes, seed_hash: bytes, frame_no: int, 
-                     frame_shape: tuple) -> Tuple[bytes, bytes]:
-        """Encrypt video frame using 2D spatial pipeline"""
+                     frame_shape: Tuple[int, int, int]) -> Tuple[bytes, bytes]:
+        """
+        Complete chaotic encryption pipeline:
+        1. S-box substitution
+        2. Block permutation  
+        3. Pixel permutation
+        4. Diffusion with chaining
+        """
         height, width, channels = frame_shape
+        
+        # Convert to numpy array for processing
         frame = np.frombuffer(frame_bytes, dtype=np.uint8).reshape(frame_shape)
         
-        # Get chaotic resources
+        # Get chaotic resources from pool
         pool_offset = get_pool_offset(seed_hash, self.pool_size)
         
-        # Step 1: Build S-box for substitution
-        sbox, _ = build_sbox(self.pool_bytes, pool_offset)
+        # STAGE 1: S-BOX SUBSTITUTION
+        sbox, _ = build_sbox_from_chaos(self.pool_bytes, pool_offset)
         
-        # Step 2: Block-level permutation
-        block_perm, _ = build_permutation(self.pool_bytes, pool_offset + 500, 64)
-        frame = self._apply_block_permutation(frame, block_perm)
+        # Apply S-box to each channel separately
+        for c in range(channels):
+            for y in range(height):
+                for x in range(width):
+                    frame[y, x, c] = sbox[frame[y, x, c]]
         
-        # Step 3: Pixel-level permutation within blocks
-        pixel_perm, _ = build_permutation(self.pool_bytes, pool_offset + 1000, 
-                                         min(1024, frame.size))
-        frame = self._apply_pixel_permutation(frame, pixel_perm)
+        # STAGE 2: BLOCK PERMUTATION (16x16 blocks)
+        frame = self._apply_block_permutation(frame, pool_offset + 1000)
         
-        # Step 4: S-box substitution
+        # STAGE 3: PIXEL PERMUTATION (within blocks)  
+        frame = self._apply_pixel_permutation(frame, pool_offset + 2000)
+        
+        # STAGE 4: DIFFUSION WITH CHAINING
         frame_flat = frame.flatten()
+        keystream = generate_chaotic_keystream(self.pool_bytes, pool_offset + 3000, len(frame_flat))
+        
+        # Chained diffusion: enc[i] = (pixel[i] XOR ks[i] + enc[i-1]) mod 256
+        encrypted_flat = np.zeros_like(frame_flat)
+        prev_enc = 0
+        
         for i in range(len(frame_flat)):
-            frame_flat[i] = sbox[frame_flat[i]]
+            encrypted_flat[i] = (frame_flat[i] ^ keystream[i] + prev_enc) % 256
+            prev_enc = encrypted_flat[i]
         
-        # Step 5: Diffusion with chaotic keystream
-        keystream_seed = self.pool_bytes[pool_offset+2000:pool_offset+2032]
-        keystream = generate_keystream(keystream_seed, len(frame_flat))
-        
-        for i in range(len(frame_flat)):
-            frame_flat[i] = (frame_flat[i] ^ keystream[i]) & 0xFF
-        
-        # Pack metadata
+        # Pack metadata (frame dimensions)
         metadata = struct.pack('>III', height, width, channels)
         
-        return frame_flat.tobytes(), metadata
+        return encrypted_flat.tobytes(), metadata
     
     def decrypt_frame(self, encrypted_data: bytes, metadata: bytes, seed_hash: bytes, 
                      frame_no: int) -> bytes:
-        """Decrypt video frame (reverse of encrypt_frame)"""
+        """Reverse all encryption stages in opposite order"""
+        
         # Unpack metadata
         height, width, channels = struct.unpack('>III', metadata)
         frame_shape = (height, width, channels)
         
-        frame_flat = np.frombuffer(encrypted_data, dtype=np.uint8).copy()
+        encrypted_flat = np.frombuffer(encrypted_data, dtype=np.uint8)
         
-        # Get chaotic resources (same as encryption)
+        # Get same chaotic resources
         pool_offset = get_pool_offset(seed_hash, self.pool_size)
-        sbox, inv_sbox = build_sbox(self.pool_bytes, pool_offset)
         
-        # Step 5 (reverse): Reverse diffusion
-        keystream_seed = self.pool_bytes[pool_offset+2000:pool_offset+2032]
-        keystream = generate_keystream(keystream_seed, len(frame_flat))
+        # STAGE 4 REVERSE: Undo diffusion with chaining
+        keystream = generate_chaotic_keystream(self.pool_bytes, pool_offset + 3000, len(encrypted_flat))
         
-        for i in range(len(frame_flat)):
-            frame_flat[i] = (frame_flat[i] ^ keystream[i]) & 0xFF
+        decrypted_flat = np.zeros_like(encrypted_flat)
+        prev_enc = 0
         
-        # Step 4 (reverse): Reverse S-box substitution
-        for i in range(len(frame_flat)):
-            frame_flat[i] = inv_sbox[frame_flat[i]]
+        for i in range(len(encrypted_flat)):
+            # Reverse: pixel[i] = (enc[i] - enc[i-1]) XOR ks[i]
+            temp = (encrypted_flat[i] - prev_enc) % 256
+            decrypted_flat[i] = temp ^ keystream[i]
+            prev_enc = encrypted_flat[i]
         
         # Reshape back to frame
-        frame = frame_flat.reshape(frame_shape)
+        frame = decrypted_flat.reshape(frame_shape)
         
-        # Step 3 (reverse): Reverse pixel-level permutation
-        pixel_perm, inv_pixel_perm = build_permutation(self.pool_bytes, pool_offset + 1000, 
-                                                      min(1024, frame.size))
-        frame = self._reverse_pixel_permutation(frame, inv_pixel_perm)
+        # STAGE 3 REVERSE: Undo pixel permutation
+        frame = self._reverse_pixel_permutation(frame, pool_offset + 2000)
         
-        # Step 2 (reverse): Reverse block-level permutation
-        block_perm, inv_block_perm = build_permutation(self.pool_bytes, pool_offset + 500, 64)
-        frame = self._reverse_block_permutation(frame, inv_block_perm)
+        # STAGE 2 REVERSE: Undo block permutation
+        frame = self._reverse_block_permutation(frame, pool_offset + 1000)
+        
+        # STAGE 1 REVERSE: Undo S-box substitution
+        _, inv_sbox = build_sbox_from_chaos(self.pool_bytes, pool_offset)
+        
+        for c in range(frame.shape[2]):
+            for y in range(frame.shape[0]):
+                for x in range(frame.shape[1]):
+                    frame[y, x, c] = inv_sbox[frame[y, x, c]]
         
         return frame.tobytes()
     
-    def _reverse_block_permutation(self, frame: np.ndarray, inv_perm: np.ndarray) -> np.ndarray:
-        """Reverse block-level permutation"""
+    def _apply_block_permutation(self, frame: np.ndarray, chaos_offset: int) -> np.ndarray:
+        """Permute 16x16 blocks using chaotic randomness"""
         height, width, channels = frame.shape
-        block_height = max(1, height // 8)
-        block_width = max(1, width // 8)
+        block_size = 16
         
-        # Create blocks
+        # Create list of blocks
         blocks = []
-        for i in range(0, height, block_height):
-            for j in range(0, width, block_width):
-                block = frame[i:i+block_height, j:j+block_width]
-                blocks.append(block)
+        positions = []
         
-        # Reverse permute blocks
-        if len(blocks) > 1 and len(inv_perm) >= len(blocks):
-            unperm_blocks = [None] * len(blocks)
-            for i in range(len(blocks)):
-                unperm_blocks[inv_perm[i] % len(blocks)] = blocks[i]
-            # Fill any None values
-            for i in range(len(unperm_blocks)):
-                if unperm_blocks[i] is None:
-                    unperm_blocks[i] = blocks[i % len(blocks)]
+        for i in range(0, height, block_size):
+            for j in range(0, width, block_size):
+                block = frame[i:min(i+block_size, height), j:min(j+block_size, width)]
+                blocks.append(block.copy())
+                positions.append((i, j))
+        
+        # Permute blocks using chaos
+        if len(blocks) > 1:
+            perm, _ = build_permutation_from_chaos(self.pool_bytes, chaos_offset, len(blocks))
+            blocks_permuted = [blocks[perm[i]] for i in range(len(blocks))]
         else:
-            unperm_blocks = blocks
+            blocks_permuted = blocks
         
         # Reconstruct frame
         result = np.zeros_like(frame)
-        idx = 0
-        for i in range(0, height, block_height):
-            for j in range(0, width, block_width):
-                if idx < len(unperm_blocks):
-                    block = unperm_blocks[idx]
-                    h_end = min(i + block.shape[0], height)
-                    w_end = min(j + block.shape[1], width)
-                    result[i:h_end, j:w_end] = block[:h_end-i, :w_end-j]
-                    idx += 1
+        for idx, (i, j) in enumerate(positions):
+            if idx < len(blocks_permuted):
+                block = blocks_permuted[idx]
+                h_end = min(i + block.shape[0], height)
+                w_end = min(j + block.shape[1], width)
+                result[i:h_end, j:w_end] = block
         
         return result
     
-    def _reverse_pixel_permutation(self, block: np.ndarray, inv_perm: np.ndarray) -> np.ndarray:
-        """Reverse pixel-level permutation"""
-        shape = block.shape
-        flat = block.flatten()
+    def _apply_pixel_permutation(self, frame: np.ndarray, chaos_offset: int) -> np.ndarray:
+        """Permute pixels within each 16x16 block"""
+        height, width, channels = frame.shape
+        block_size = 16
         
-        if len(inv_perm) >= len(flat):
-            inv_perm_indices = inv_perm[:len(flat)]
-            unpermuted_flat = np.zeros_like(flat)
-            unpermuted_flat[inv_perm_indices] = flat
+        result = frame.copy()
+        
+        for i in range(0, height, block_size):
+            for j in range(0, width, block_size):
+                # Extract block
+                block = frame[i:min(i+block_size, height), j:min(j+block_size, width)]
+                
+                if block.size > 1:  # Only permute if block has multiple pixels
+                    # Permute each channel separately
+                    for c in range(channels):
+                        channel_data = block[:, :, c].flatten()
+                        if len(channel_data) > 1:
+                            # Build permutation for this block
+                            block_offset = chaos_offset + (i * width + j) % 1000
+                            perm, _ = build_permutation_from_chaos(self.pool_bytes, block_offset, len(channel_data))
+                            
+                            # Apply permutation
+                            channel_permuted = channel_data[perm]
+                            block[:, :, c] = channel_permuted.reshape(block[:, :, c].shape)
+                
+                # Put block back
+                h_end = min(i + block.shape[0], height)
+                w_end = min(j + block.shape[1], width)
+                result[i:h_end, j:w_end] = block
+        
+        return result
+    
+    def _reverse_block_permutation(self, frame: np.ndarray, chaos_offset: int) -> np.ndarray:
+        """Reverse block permutation"""
+        height, width, channels = frame.shape
+        block_size = 16
+        
+        # Create list of blocks and positions
+        blocks = []
+        positions = []
+        
+        for i in range(0, height, block_size):
+            for j in range(0, width, block_size):
+                block = frame[i:min(i+block_size, height), j:min(j+block_size, width)]
+                blocks.append(block.copy())
+                positions.append((i, j))
+        
+        # Build inverse permutation
+        if len(blocks) > 1:
+            _, inv_perm = build_permutation_from_chaos(self.pool_bytes, chaos_offset, len(blocks))
+            blocks_restored = [blocks[inv_perm[i]] for i in range(len(blocks))]
         else:
-            unpermuted_flat = flat
+            blocks_restored = blocks
         
-        return unpermuted_flat.reshape(shape)
-
-
-# ============================
-# AUDIO ENCRYPTION PIPELINE (1D TEMPORAL)
-# ============================
-
-class AudioChaoticCipher:
-    """1D Temporal Audio Encryption using Chaotic Lorenz Pipeline"""
+        # Reconstruct frame
+        result = np.zeros_like(frame)
+        for idx, (i, j) in enumerate(positions):
+            if idx < len(blocks_restored):
+                block = blocks_restored[idx]
+                h_end = min(i + block.shape[0], height)
+                w_end = min(j + block.shape[1], width)
+                result[i:h_end, j:w_end] = block
+        
+        return result
     
-    def __init__(self, pool_bytes: bytes, salt: bytes):
-        self.pool_bytes = pool_bytes
-        self.salt = salt
-        self.pool_size = len(pool_bytes)
+    def _reverse_pixel_permutation(self, frame: np.ndarray, chaos_offset: int) -> np.ndarray:
+        """Reverse pixel permutation within blocks"""
+        height, width, channels = frame.shape
+        block_size = 16
+        
+        result = frame.copy()
+        
+        for i in range(0, height, block_size):
+            for j in range(0, width, block_size):
+                # Extract block
+                block = frame[i:min(i+block_size, height), j:min(j+block_size, width)]
+                
+                if block.size > 1:
+                    # Reverse permute each channel
+                    for c in range(channels):
+                        channel_data = block[:, :, c].flatten()
+                        if len(channel_data) > 1:
+                            # Build inverse permutation for this block
+                            block_offset = chaos_offset + (i * width + j) % 1000
+                            _, inv_perm = build_permutation_from_chaos(self.pool_bytes, block_offset, len(channel_data))
+                            
+                            # Apply inverse permutation
+                            channel_restored = channel_data[inv_perm]
+                            block[:, :, c] = channel_restored.reshape(block[:, :, c].shape)
+                
+                # Put block back
+                h_end = min(i + block.shape[0], height)
+                w_end = min(j + block.shape[1], width)
+                result[i:h_end, j:w_end] = block
+        
+        return result
+
+
+# Audio encryption functions
+def encrypt_audio_dct_double(audio_segment: np.ndarray, seed_hash: bytes) -> Tuple[bytes, bytes]:
+    """Double DCT audio encryption"""
+    # Convert to float
+    audio_float = audio_segment.astype(np.float64)
     
-    def _derive_frame_key(self, frame_no: int, last_state: Optional[bytes] = None) -> bytes:
-        """Derive unique key for each audio frame"""
-        if last_state is None:
-            last_state = b'\x00' * 12  # Default state
-        
-        data = last_state + struct.pack('>Q', frame_no) + self.salt
-        return hashlib.sha256(data).digest()
+    # First DCT
+    dct1 = dct(audio_float, norm='ortho')
     
-    def _get_keystream(self, seed: bytes, length: int) -> np.ndarray:
-        """Generate keystream from chaotic pool"""
-        # Use seed to determine pool offset
-        offset = struct.unpack('>Q', seed[:8])[0] % (self.pool_size - length * 2)
-        
-        # Extract keystream bytes and convert to int16
-        keystream_bytes = self.pool_bytes[offset:offset + length * 2]
-        keystream = []
-        for i in range(0, len(keystream_bytes), 2):
-            if i + 1 < len(keystream_bytes):
-                val = struct.unpack('>H', keystream_bytes[i:i+2])[0]
-                # Convert to signed 16-bit range, scaled to avoid overflow
-                keystream.append((val - 32768) // 8)
-        
-        return np.array(keystream[:length], dtype=np.int16)
+    # Second DCT
+    dct2 = dct(dct1, norm='ortho')
     
-    def _get_permutation(self, seed: bytes, length: int) -> Tuple[np.ndarray, np.ndarray]:
-        """Generate permutation from chaotic pool"""
-        offset = (struct.unpack('>Q', seed[8:16])[0] % (self.pool_size - length)) 
-        perm_bytes = self.pool_bytes[offset:offset + length]
-        
-        # Create permutation using Fisher-Yates shuffle
-        perm = np.arange(length)
-        for i in range(length - 1, 0, -1):
-            j = perm_bytes[length - 1 - i] % (i + 1)
-            perm[i], perm[j] = perm[j], perm[i]
-        
-        # Create inverse permutation
-        inv_perm = np.argsort(perm)
-        
-        return perm, inv_perm
+    # Generate key from seed
+    key_seed = struct.unpack('>Q', seed_hash[:8])[0]
+    np.random.seed(key_seed & 0xFFFFFFFF)
+    chaos_key = np.random.random(len(dct2)) * 1000 - 500
     
-    def encrypt_frame(self, audio_frame: np.ndarray, frame_no: int, 
-                     last_state: Optional[bytes] = None) -> Tuple[bytes, bytes]:
-        """Encrypt single audio frame using 1D temporal pipeline"""
-        # Ensure int16 format
-        if audio_frame.dtype != np.int16:
-            audio_frame = audio_frame.astype(np.int16)
-        
-        frame_len = len(audio_frame)
-        
-        # Derive frame key
-        frame_key = self._derive_frame_key(frame_no, last_state)
-        
-        # Stage 1: Stream cipher (XOR with keystream)
-        keystream = self._get_keystream(frame_key, frame_len)
-        encrypted = audio_frame.astype(np.int32)
-        for i in range(len(encrypted)):
-            encrypted[i] = (encrypted[i] + keystream[i]) & 0xFFFF
-            if encrypted[i] > 32767:
-                encrypted[i] -= 65536
-        encrypted = encrypted.astype(np.int16)
-        
-        # Stage 2: Frame-level permutation (sample scrambling)
-        perm, _ = self._get_permutation(frame_key, frame_len)
-        permuted = encrypted[perm]
-        
-        # Stage 3: Temporal diffusion (each sample depends on previous)
-        diffused = permuted.copy().astype(np.int32)
-        for i in range(1, len(diffused)):
-            diffused[i] = (diffused[i] + (diffused[i-1] // 4)) & 0xFFFF
-            if diffused[i] > 32767:
-                diffused[i] -= 65536
-        
-        # Convert back to int16
-        diffused = diffused.astype(np.int16)
-        
-        # Return encrypted frame and current state for next frame
-        current_state = frame_key[:12]  # Use part of key as state
-        
-        return diffused.tobytes(), current_state
+    # Encrypt: add chaos key
+    encrypted_dct = dct2 + chaos_key
     
-    def decrypt_frame(self, encrypted_data: bytes, frame_no: int,
-                     last_state: Optional[bytes] = None) -> Tuple[np.ndarray, bytes]:
-        """Decrypt single audio frame (reverse of encrypt_frame)"""
-        # Convert bytes back to int16 array
-        encrypted_frame = np.frombuffer(encrypted_data, dtype=np.int16)
-        frame_len = len(encrypted_frame)
-        
-        # Derive same frame key
-        frame_key = self._derive_frame_key(frame_no, last_state)
-        
-        # Stage 3 (reverse): Reverse temporal diffusion
-        diffused = encrypted_frame.astype(np.int32)
-        for i in range(frame_len - 1, 0, -1):
-            diffused[i] = (diffused[i] - (diffused[i-1] // 4)) & 0xFFFF
-            if diffused[i] > 32767:
-                diffused[i] -= 65536
-        
-        # Convert back to int16
-        undiffused = diffused.astype(np.int16)
-        
-        # Stage 2 (reverse): Reverse frame-level permutation
-        perm, inv_perm = self._get_permutation(frame_key, frame_len)
-        unpermuted = undiffused[inv_perm]
-        
-        # Stage 1 (reverse): Reverse stream cipher
-        keystream = self._get_keystream(frame_key, frame_len)
-        decrypted = unpermuted.astype(np.int32)
-        for i in range(len(decrypted)):
-            decrypted[i] = (decrypted[i] - keystream[i]) & 0xFFFF
-            if decrypted[i] > 32767:
-                decrypted[i] -= 65536
-        decrypted = decrypted.astype(np.int16)
-        
-        # Return decrypted frame and current state
-        current_state = frame_key[:12]
-        
-        return decrypted, current_state
-
-
-# ============================
-# PUBLIC INTERFACE FUNCTIONS
-# ============================
-
-def encrypt_video_data(data: bytes, pool_bytes: bytes, seed_hash: bytes, frame_no: int, 
-                      frame_shape: tuple) -> Tuple[bytes, bytes]:
-    """Encrypt VIDEO data using 2D spatial pipeline"""
-    cipher = VideoChaoticCipher(pool_bytes)
-    return cipher.encrypt_frame(data, seed_hash, frame_no, frame_shape)
-
-
-def decrypt_video_data(ciphertext: bytes, metadata: bytes, pool_bytes: bytes, 
-                      seed_hash: bytes, frame_no: int) -> bytes:
-    """Decrypt VIDEO data using 2D spatial pipeline"""
-    cipher = VideoChaoticCipher(pool_bytes)
-    return cipher.decrypt_frame(ciphertext, metadata, seed_hash, frame_no)
-
-
-def encrypt_audio_data(audio_frame: np.ndarray, pool_bytes: bytes, seed_hash: bytes, 
-                      frame_no: int, last_state: Optional[bytes] = None) -> Tuple[bytes, bytes]:
-    """Encrypt AUDIO data using 1D temporal pipeline"""
-    cipher = AudioChaoticCipher(pool_bytes, seed_hash[:16])  # Use part of seed as salt
-    encrypted_data, new_state = cipher.encrypt_frame(audio_frame, frame_no, last_state)
+    # Convert to int16 for transmission
+    encrypted_audio = np.clip(encrypted_dct, -32768, 32767).astype(np.int16)
     
-    # Pack metadata: [frame_no(8)] [state_len(4)] [state]
-    metadata = (struct.pack('>Q', frame_no) + 
-               struct.pack('>I', len(new_state)) + 
-               new_state)
+    # Metadata
+    metadata = struct.pack('>QI', key_seed, len(audio_segment))
     
-    return encrypted_data, metadata
+    return encrypted_audio.tobytes(), metadata
 
 
-def decrypt_audio_data(encrypted_data: bytes, metadata: bytes, pool_bytes: bytes, 
-                      seed_hash: bytes) -> Tuple[np.ndarray, bytes]:
-    """Decrypt AUDIO data using 1D temporal pipeline"""
+def decrypt_audio_dct_double(encrypted_data: bytes, metadata: bytes) -> np.ndarray:
+    """Double DCT audio decryption"""
     # Unpack metadata
-    frame_no = struct.unpack('>Q', metadata[:8])[0]
-    state_len = struct.unpack('>I', metadata[8:12])[0]
-    last_state = metadata[12:12+state_len] if state_len > 0 else None
+    key_seed, frame_len = struct.unpack('>QI', metadata)
     
-    cipher = AudioChaoticCipher(pool_bytes, seed_hash[:16])  # Use part of seed as salt
-    decrypted_frame, new_state = cipher.decrypt_frame(encrypted_data, frame_no, last_state)
+    # Convert back to float
+    encrypted_audio = np.frombuffer(encrypted_data, dtype=np.int16).astype(np.float64)
     
-    return decrypted_frame, new_state
+    # Generate same key
+    np.random.seed(key_seed & 0xFFFFFFFF)
+    chaos_key = np.random.random(len(encrypted_audio)) * 1000 - 500
+    
+    # Decrypt: subtract key
+    decrypted_dct2 = encrypted_audio - chaos_key
+    
+    # Reverse second DCT
+    decrypted_dct1 = idct(decrypted_dct2, norm='ortho')
+    
+    # Reverse first DCT
+    decrypted_audio = idct(decrypted_dct1, norm='ortho')
+    
+    # Convert back to int16
+    result = np.clip(decrypted_audio, -32768, 32767).astype(np.int16)
+    
+    return result
 
 
 def compute_hmac(metadata: bytes, ciphertext: bytes, salt: bytes) -> bytes:
-    """Compute HMAC-SHA256 over metadata + ciphertext"""
+    """Compute HMAC-SHA256 authentication tag"""
     data = metadata + ciphertext
     return hmac.new(salt, data, hashlib.sha256).digest()
 
 
 def verify_hmac(metadata: bytes, ciphertext: bytes, tag: bytes, salt: bytes) -> bool:
-    """Verify HMAC tag"""
+    """Verify HMAC authentication tag"""
     expected_tag = compute_hmac(metadata, ciphertext, salt)
     return hmac.compare_digest(tag, expected_tag)

@@ -1,4 +1,4 @@
-# slave.py
+# slave.py - Video Decryption System
 import argparse
 import socket
 import struct
@@ -8,73 +8,63 @@ import cv2
 import numpy as np
 import pyaudio
 import os
+import wave
 from cipher_system import (
-    load_pool_bytes, derive_seed_hash, decrypt_video_data, decrypt_audio_data, verify_hmac
+    VideoChaoticCipher, derive_seed_hash, decrypt_audio_dct_double, verify_hmac
 )
-from lorenz_system import generate_pool_bytes
+from lorenz_system import generate_pool_bytes, load_pool_bytes
 
 
 class SlaveSystem:
     def __init__(self, args):
-        self.args = args
         self.host = args.host
         self.port = args.port
         
-        # Load or generate pool bytes
-        if args.pool_file:
-            if os.path.exists(args.pool_file):
-                self.pool_bytes = load_pool_bytes(args.pool_file)
-            else:
-                print(f"Pool file '{args.pool_file}' not found. Generating new pool...")
-                self.pool_bytes = generate_pool_bytes(args.pool_size_mb)
-                # Save for future use
+        # Load or generate same Lorenz pool as master
+        if args.pool_file and os.path.exists(args.pool_file):
+            print(f"Loading existing pool from {args.pool_file}")
+            self.pool_bytes = load_pool_bytes(args.pool_file)
+        else:
+            print("Generating new Lorenz chaos pool...")
+            self.pool_bytes = generate_pool_bytes(args.pool_size_mb)
+            if args.pool_file:
                 with open(args.pool_file, 'wb') as f:
                     f.write(self.pool_bytes)
-                print(f"Pool saved to '{args.pool_file}'")
-        else:
-            self.pool_bytes = generate_pool_bytes(args.pool_size_mb)
+                print(f"Pool saved to {args.pool_file}")
         
         self.salt = args.salt.encode()
-        self.block_size = args.block_size
-        self.rounds = args.rounds
-        self.mode = args.mode
+        self.final_lorenz_state = (1.0, 1.0, 1.0)  # Must match master
         
-        # Networking
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.running = False
         
-        # Video display
-        self.video_thread = None
+        # Initialize cipher
+        self.video_cipher = VideoChaoticCipher(self.pool_bytes)
         
-        # Audio playback
+        # Audio setup
         self.audio = None
         self.audio_stream = None
-        self.audio_thread = None
-        self.audio_last_state = None
         
-        # Create samples directories if they don't exist
-        os.makedirs('samples/audio', exist_ok=True)
-        os.makedirs('samples/video', exist_ok=True)
+        # Create output directories
+        os.makedirs('output/video/decrypted', exist_ok=True)
+        os.makedirs('output/audio', exist_ok=True)
         
-        print(f"Slave initialized: {args.mode} mode, block_size={args.block_size}, rounds={args.rounds}")
+        self.video_frame_count = 0
+        self.audio_saved = False
 
     def connect_to_master(self):
         """Connect to master server"""
         try:
-            # Send discovery message
+            print(f"Connecting to master at {self.host}:{self.port}")
             self.sock.sendto(b"DISCOVER", (self.host, self.port))
-            
-            # Wait for acknowledgment
             self.sock.settimeout(5.0)
             data, addr = self.sock.recvfrom(1024)
             
             if data == b"ACK":
-                print(f"Connected to master at {addr}")
                 self.sock.settimeout(None)
+                print("Successfully connected to master")
                 return True
-            else:
-                print("Invalid response from master")
-                return False
+            return False
                 
         except Exception as e:
             print(f"Failed to connect to master: {e}")
@@ -82,192 +72,197 @@ class SlaveSystem:
 
     def start_audio_playback(self):
         """Initialize audio playback"""
-        if self.mode not in ['audio', 'both']:
-            return
-            
-        self.audio = pyaudio.PyAudio()
-        
-        # Audio parameters (must match master)
-        format = pyaudio.paInt16
-        channels = 1
-        rate = 44100
-        
         try:
+            self.audio = pyaudio.PyAudio()
+            
             self.audio_stream = self.audio.open(
-                format=format,
-                channels=channels,  
-                rate=rate,
-                output=True
+                format=pyaudio.paInt16,
+                channels=1,
+                rate=22050,
+                output=True,
+                frames_per_buffer=1024
             )
             print("Audio playback initialized")
         except Exception as e:
-            print(f"Failed to initialize audio playback: {e}")
+            print(f"Audio setup error: {e}")
 
-    def save_decrypted_audio_sample(self, audio_data: bytes, frame_no: int):
-        """Save decrypted audio sample for debugging"""
-        try:
-            if frame_no in [1, 3, 5]:  # Save only specific frames
-                filename = f'samples/audio/audio_{frame_no}_decrypted.bin'
-                with open(filename, 'wb') as f:
-                    f.write(audio_data)
-                print(f"Saved decrypted audio sample {frame_no}")
-        except Exception as e:
-            print(f"Error saving decrypted audio sample: {e}")
-
-    def process_video_packet(self, ciphertext: bytes, metadata: bytes, tag: bytes):
-        """Process and display video packet"""
+    def process_video_packet(self, encrypted_data: bytes, metadata: bytes, tag: bytes):
+        """Decrypt and display video frame"""
         try:
             # Verify HMAC
-            if not verify_hmac(metadata, ciphertext, tag, self.salt):
-                print("Video packet HMAC verification failed")
+            if not verify_hmac(metadata, encrypted_data, tag, self.salt):
+                print("Video HMAC verification failed")
                 return
             
-            # Unpack frame metadata
-            width, height, frame_no = struct.unpack('>III', metadata[:12])
-            cipher_metadata = metadata[12:]
+            # Unpack metadata
+            frame_no = struct.unpack('>Q', metadata[:8])[0]
+            cipher_metadata = metadata[8:]
             
-            # Generate seed for this frame
-            seed_hash = derive_seed_hash(frame_no, self.salt)
+            print(f"Decrypting frame {frame_no} using chaotic pipeline...")
             
-            # Decrypt frame data using VIDEO pipeline (2D spatial)
-            frame_bytes = decrypt_video_data(
-                ciphertext, cipher_metadata, self.pool_bytes, 
-                seed_hash, frame_no
+            # CHAOTIC VIDEO DECRYPTION PIPELINE
+            seed_hash = derive_seed_hash(frame_no, self.salt, self.final_lorenz_state)
+            
+            decrypted_bytes = self.video_cipher.decrypt_frame(
+                encrypted_data, cipher_metadata, seed_hash, frame_no
             )
             
-            # Reconstruct frame
-            expected_size = width * height * 3  # RGB
-            if len(frame_bytes) != expected_size:
-                print(f"Frame size mismatch: expected {expected_size}, got {len(frame_bytes)}")
-                return
+            # Unpack frame dimensions from cipher metadata
+            height, width, channels = struct.unpack('>III', cipher_metadata)
+            frame_shape = (height, width, channels)
             
-            # Convert RGB to BGR for OpenCV display
-            frame_rgb = np.frombuffer(frame_bytes, dtype=np.uint8).reshape((height, width, 3))
-            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+            # Convert bytes back to frame
+            decrypted_array = np.frombuffer(decrypted_bytes, dtype=np.uint8)
+            decrypted_frame = decrypted_array.reshape(frame_shape)
             
-            # Display frame (FIXED DISPLAY)
-            cv2.imshow('Slave - Decrypted Video', frame_bgr)
+            # Convert RGB to BGR for display
+            decrypted_bgr = cv2.cvtColor(decrypted_frame, cv2.COLOR_RGB2BGR)
+            
+            # Display decrypted frame
+            cv2.imshow('Slave - Decrypted Video', decrypted_bgr)
             cv2.waitKey(1)
             
+            # Save decrypted frame (first 3 frames only)
+            if frame_no < 3:
+                decrypted_path = f'output/video/decrypted/frame_{frame_no:06d}_decrypted.png'
+                cv2.imwrite(decrypted_path, decrypted_bgr)
+                print(f"Saved decrypted frame {frame_no}")
+            
+            self.video_frame_count += 1
+            print(f"Successfully decrypted and displayed frame {frame_no}")
+            
         except Exception as e:
-            print(f"Video processing error: {e}")
+            print(f"Video decryption error: {e}")
+            import traceback
+            traceback.print_exc()
 
-    def process_audio_packet(self, ciphertext: bytes, metadata: bytes, tag: bytes):
-        """Process and play audio packet"""
+    def process_audio_packet(self, encrypted_data: bytes, metadata: bytes, tag: bytes):
+        """Decrypt and play audio segment"""
+        if self.audio_saved:
+            return
+        
         try:
             # Verify HMAC
-            if not verify_hmac(metadata, ciphertext, tag, self.salt):
-                print("Audio packet HMAC verification failed")
+            if not verify_hmac(metadata, encrypted_data, tag, self.salt):
+                print("Audio HMAC verification failed")
                 return
             
-            # Unpack audio metadata - first 8 bytes is frame_no
-            frame_no = struct.unpack('>Q', metadata[:8])[0]
+            print("Decrypting audio using double DCT...")
             
-            # Generate seed for this audio packet
-            seed_hash = derive_seed_hash(frame_no, self.salt)
+            # Decrypt audio using double DCT
+            decrypted_audio = decrypt_audio_dct_double(encrypted_data, metadata)
             
-            # Decrypt audio data using AUDIO pipeline (1D temporal)
-            decrypted_frame, self.audio_last_state = decrypt_audio_data(
-                ciphertext, metadata, self.pool_bytes, seed_hash
-            )
-            
-            # Save decrypted audio sample
-            self.save_decrypted_audio_sample(decrypted_frame.tobytes(), frame_no)
-            
-            # Play audio directly
+            # Play audio
             if self.audio_stream:
-                self.audio_stream.write(decrypted_frame.tobytes())
-                
+                try:
+                    self.audio_stream.write(decrypted_audio.tobytes())
+                    print("Audio playback started")
+                except Exception as e:
+                    print(f"Audio playback error: {e}")
+            
+            # Save decrypted audio
+            decrypted_path = 'output/audio/segment_0000_decrypted.wav'
+            with wave.open(decrypted_path, 'wb') as wav_file:
+                wav_file.setnchannels(1)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(22050)
+                wav_file.writeframes(decrypted_audio.tobytes())
+            
+            print(f"Saved decrypted audio: {decrypted_path}")
+            self.audio_saved = True
+            
         except Exception as e:
-            print(f"Audio processing error: {e}")
+            print(f"Audio decryption error: {e}")
+            import traceback
+            traceback.print_exc()
 
-    def packet_receiver(self):
-        """Main packet receiving loop"""
+    def receive_packets(self):
+        """Main packet receiving and processing loop"""
+        print("Starting packet receiver...")
+        
         while self.running:
             try:
-                data, addr = self.sock.recvfrom(65536)  # Large buffer for video frames
+                packet, addr = self.sock.recvfrom(65536)
                 
-                if len(data) < 13:  # Minimum header size
+                if len(packet) < 13:  # Minimum header size
                     continue
                 
                 # Parse packet header: [type(1)] [metadata_len(4)] [data_len(4)] [tag_len(4)]
-                packet_type = data[0:1]
-                metadata_len, data_len, tag_len = struct.unpack('>III', data[1:13])
+                packet_type = packet[0:1]
+                metadata_len, data_len, tag_len = struct.unpack('>III', packet[1:13])
                 
                 # Extract packet components
-                metadata = data[13:13+metadata_len]
-                ciphertext = data[13+metadata_len:13+metadata_len+data_len]
-                tag = data[13+metadata_len+data_len:13+metadata_len+data_len+tag_len]
+                metadata = packet[13:13+metadata_len]
+                encrypted_data = packet[13+metadata_len:13+metadata_len+data_len]
+                tag = packet[13+metadata_len+data_len:13+metadata_len+data_len+tag_len]
                 
-                # Process based on packet type
-                if packet_type == b'V' and self.mode in ['video', 'both']:
-                    self.process_video_packet(ciphertext, metadata, tag)
-                elif packet_type == b'A' and self.mode in ['audio', 'both']:
-                    self.process_audio_packet(ciphertext, metadata, tag)
+                if packet_type == b'V':
+                    print(f"Received video packet (data: {len(encrypted_data)} bytes)")
+                    self.process_video_packet(encrypted_data, metadata, tag)
+                elif packet_type == b'A':
+                    print(f"Received audio packet (data: {len(encrypted_data)} bytes)")
+                    self.process_audio_packet(encrypted_data, metadata, tag)
+                else:
+                    print(f"Unknown packet type: {packet_type}")
                     
             except Exception as e:
-                if self.running:
-                    print(f"Packet receiving error: {e}")
+                print(f"Packet receive error: {e}")
+                time.sleep(0.1)
 
     def run(self):
-        """Start the slave system"""
+        """Main execution function"""
         try:
-            # Connect to master
+            print("=== CHAOTIC VIDEO DECRYPTION SLAVE ===")
+            print("Pipeline: Reverse Chained Diffusion → Reverse Pixel Permutation → Reverse Block Permutation → Inverse S-box")
+            print("Chaos Source: Lorenz Attractor System")
+            print("Audio: Double DCT Decryption")
+            print()
+            
             if not self.connect_to_master():
+                print("Failed to connect to master. Exiting...")
                 return
             
             self.running = True
             
             # Initialize audio playback
-            if self.mode in ['audio', 'both']:
-                self.start_audio_playback()
+            self.start_audio_playback()
             
-            # Start packet receiver thread
-            receiver_thread = threading.Thread(target=self.packet_receiver, daemon=True)
-            receiver_thread.start()
+            print("Ready to receive encrypted packets...")
+            print("Press Ctrl+C to stop")
             
-            print("Slave system running. Press Ctrl+C to stop.")
-            print("Decrypted video will display in 'Slave - Decrypted Video' window if enabled.")
+            # Start packet receiver
+            self.receive_packets()
             
-            # Keep main thread alive
-            while self.running:
-                time.sleep(1)
-                
         except KeyboardInterrupt:
-            print("\nStopping slave system...")
             self.running = False
+            print("\nShutting down slave system...")
         finally:
             self.cleanup()
 
     def cleanup(self):
-        """Cleanup resources"""
+        """Clean up resources"""
         self.running = False
         
         if self.sock:
             self.sock.close()
-            
+        
         if self.audio_stream:
-            self.audio_stream.stop_stream()
             self.audio_stream.close()
-            
+        
         if self.audio:
             self.audio.terminate()
-            
-        cv2.destroyAllWindows()
         
-        print("Slave system stopped")
+        cv2.destroyAllWindows()
+        print("Cleanup completed")
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Lorenz Cipher Slave System')
-    parser.add_argument('--host', default='127.0.0.1', help='Master host address')
-    parser.add_argument('--port', type=int, default=5000, help='Master UDP port')
-    parser.add_argument('--pool-file', help='Path to Lorenz pool bytes file (optional)')
-    parser.add_argument('--pool-size-mb', type=int, default=1, help='Pool size in MB if generating (default: 1)')
-    parser.add_argument('--salt', required=True, help='HMAC salt string (must match master)')
-    parser.add_argument('--block-size', type=int, default=768, help='Encryption block size')
-    parser.add_argument('--rounds', type=int, default=3, help='Number of encryption rounds')
-    parser.add_argument('--mode', choices=['video', 'audio', 'both'], default='both', help='Playback mode')
+    parser = argparse.ArgumentParser(description='Chaotic Video Decryption Slave')
+    parser.add_argument('--host', default='127.0.0.1', help='Master host')
+    parser.add_argument('--port', type=int, default=5000, help='Master port')
+    parser.add_argument('--pool-file', default='lorenz_pool.bin', help='Lorenz pool file (must match master)')
+    parser.add_argument('--pool-size-mb', type=int, default=1, help='Pool size in MB if generating')
+    parser.add_argument('--salt', required=True, help='Encryption salt (must match master)')
     
     args = parser.parse_args()
     
