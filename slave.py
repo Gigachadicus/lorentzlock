@@ -1,3 +1,4 @@
+# slave.py
 import argparse
 import socket
 import struct
@@ -6,8 +7,9 @@ import time
 import cv2
 import numpy as np
 import pyaudio
-from lorenz_cipher import (
-    load_pool_bytes, derive_seed_hash, decrypt_data, verify_hmac
+import os
+from cipher_system import (
+    load_pool_bytes, derive_seed_hash, decrypt_video_data, decrypt_audio_data, verify_hmac
 )
 from lorenz_system import generate_pool_bytes
 
@@ -20,7 +22,15 @@ class SlaveSystem:
         
         # Load or generate pool bytes
         if args.pool_file:
-            self.pool_bytes = load_pool_bytes(args.pool_file)
+            if os.path.exists(args.pool_file):
+                self.pool_bytes = load_pool_bytes(args.pool_file)
+            else:
+                print(f"Pool file '{args.pool_file}' not found. Generating new pool...")
+                self.pool_bytes = generate_pool_bytes(args.pool_size_mb)
+                # Save for future use
+                with open(args.pool_file, 'wb') as f:
+                    f.write(self.pool_bytes)
+                print(f"Pool saved to '{args.pool_file}'")
         else:
             self.pool_bytes = generate_pool_bytes(args.pool_size_mb)
         
@@ -40,6 +50,11 @@ class SlaveSystem:
         self.audio = None
         self.audio_stream = None
         self.audio_thread = None
+        self.audio_last_state = None
+        
+        # Create samples directories if they don't exist
+        os.makedirs('samples/audio', exist_ok=True)
+        os.makedirs('samples/video', exist_ok=True)
         
         print(f"Slave initialized: {args.mode} mode, block_size={args.block_size}, rounds={args.rounds}")
 
@@ -88,6 +103,17 @@ class SlaveSystem:
         except Exception as e:
             print(f"Failed to initialize audio playback: {e}")
 
+    def save_decrypted_audio_sample(self, audio_data: bytes, frame_no: int):
+        """Save decrypted audio sample for debugging"""
+        try:
+            if frame_no in [1, 3, 5]:  # Save only specific frames
+                filename = f'samples/audio/audio_{frame_no}_decrypted.bin'
+                with open(filename, 'wb') as f:
+                    f.write(audio_data)
+                print(f"Saved decrypted audio sample {frame_no}")
+        except Exception as e:
+            print(f"Error saving decrypted audio sample: {e}")
+
     def process_video_packet(self, ciphertext: bytes, metadata: bytes, tag: bytes):
         """Process and display video packet"""
         try:
@@ -103,10 +129,10 @@ class SlaveSystem:
             # Generate seed for this frame
             seed_hash = derive_seed_hash(frame_no, self.salt)
             
-            # Decrypt frame data
-            frame_bytes = decrypt_data(
+            # Decrypt frame data using VIDEO pipeline (2D spatial)
+            frame_bytes = decrypt_video_data(
                 ciphertext, cipher_metadata, self.pool_bytes, 
-                seed_hash, self.block_size, self.rounds
+                seed_hash, frame_no
             )
             
             # Reconstruct frame
@@ -115,10 +141,12 @@ class SlaveSystem:
                 print(f"Frame size mismatch: expected {expected_size}, got {len(frame_bytes)}")
                 return
             
-            frame = np.frombuffer(frame_bytes, dtype=np.uint8).reshape((height, width, 3))
+            # Convert RGB to BGR for OpenCV display
+            frame_rgb = np.frombuffer(frame_bytes, dtype=np.uint8).reshape((height, width, 3))
+            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
             
-            # Display frame
-            cv2.imshow('Decrypted Video', frame)
+            # Display frame (FIXED DISPLAY)
+            cv2.imshow('Slave - Decrypted Video', frame_bgr)
             cv2.waitKey(1)
             
         except Exception as e:
@@ -132,25 +160,23 @@ class SlaveSystem:
                 print("Audio packet HMAC verification failed")
                 return
             
-            # Unpack audio metadata
-            frame_no = struct.unpack('>I', metadata[:4])[0]
-            cipher_metadata = metadata[4:]
+            # Unpack audio metadata - first 8 bytes is frame_no
+            frame_no = struct.unpack('>Q', metadata[:8])[0]
             
             # Generate seed for this audio packet
             seed_hash = derive_seed_hash(frame_no, self.salt)
             
-            # Decrypt audio data
-            audio_bytes = decrypt_data(
-                ciphertext, cipher_metadata, self.pool_bytes,
-                seed_hash, self.block_size, self.rounds
+            # Decrypt audio data using AUDIO pipeline (1D temporal)
+            decrypted_frame, self.audio_last_state = decrypt_audio_data(
+                ciphertext, metadata, self.pool_bytes, seed_hash
             )
             
             # Save decrypted audio sample
-            self.save_decrypted_audio_sample(audio_bytes, frame_no)
+            self.save_decrypted_audio_sample(decrypted_frame.tobytes(), frame_no)
             
-            # Play audio
+            # Play audio directly
             if self.audio_stream:
-                self.audio_stream.write(audio_bytes)
+                self.audio_stream.write(decrypted_frame.tobytes())
                 
         except Exception as e:
             print(f"Audio processing error: {e}")
@@ -201,7 +227,7 @@ class SlaveSystem:
             receiver_thread.start()
             
             print("Slave system running. Press Ctrl+C to stop.")
-            print("Video will display in OpenCV window if enabled.")
+            print("Decrypted video will display in 'Slave - Decrypted Video' window if enabled.")
             
             # Keep main thread alive
             while self.running:

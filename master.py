@@ -1,3 +1,4 @@
+# master.py
 import argparse
 import socket
 import struct
@@ -6,8 +7,9 @@ import time
 import cv2
 import numpy as np
 import pyaudio
-from lorenz_cipher import (
-    load_pool_bytes, derive_seed_hash, encrypt_data, compute_hmac
+import os
+from cipher_system import (
+    load_pool_bytes, derive_seed_hash, encrypt_video_data, encrypt_audio_data, compute_hmac
 )
 from lorenz_system import generate_pool_bytes
 
@@ -20,7 +22,15 @@ class MasterSystem:
         
         # Load or generate pool bytes
         if args.pool_file:
-            self.pool_bytes = load_pool_bytes(args.pool_file)
+            if os.path.exists(args.pool_file):
+                self.pool_bytes = load_pool_bytes(args.pool_file)
+            else:
+                print(f"Pool file '{args.pool_file}' not found. Generating new pool...")
+                self.pool_bytes = generate_pool_bytes(args.pool_size_mb)
+                # Save for future use
+                with open(args.pool_file, 'wb') as f:
+                    f.write(self.pool_bytes)
+                print(f"Pool saved to '{args.pool_file}'")
         else:
             self.pool_bytes = generate_pool_bytes(args.pool_size_mb)
         
@@ -46,6 +56,11 @@ class MasterSystem:
         # Frame counter for seed generation
         self.video_frame_no = 0
         self.audio_frame_no = 0
+        self.audio_last_state = None
+        
+        # Create samples directories if they don't exist
+        os.makedirs('samples/audio', exist_ok=True)
+        os.makedirs('samples/video', exist_ok=True)
         
         print(f"Master initialized: {args.mode} mode, block_size={args.block_size}, rounds={args.rounds}")
 
@@ -88,6 +103,17 @@ class MasterSystem:
                 print(f"Failed to send to {client_addr}: {e}")
                 self.clients.discard(client_addr)
 
+    def save_audio_sample(self, audio_data: bytes, frame_no: int):
+        """Save original audio sample for debugging"""
+        try:
+            if frame_no in [1, 3, 5]:  # Save only specific frames
+                filename = f'samples/audio/audio_{frame_no}_original.bin'
+                with open(filename, 'wb') as f:
+                    f.write(audio_data)
+                print(f"Saved original audio sample {frame_no}")
+        except Exception as e:
+            print(f"Error saving audio sample: {e}")
+
     def start_video_capture(self):
         """Start video capture and encryption"""
         if self.mode not in ['video', 'both']:
@@ -118,20 +144,25 @@ class MasterSystem:
                 continue
             
             try:
-                # Convert frame to bytes
-                frame_bytes = frame.tobytes()
+                # Display original frame at master (LOCAL DISPLAY FIX)
+                cv2.imshow('Master - Original Video', frame)
+                cv2.waitKey(1)
+                
+                # Convert frame to RGB bytes for encryption
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frame_bytes = frame_rgb.tobytes()
                 
                 # Generate seed for this frame
                 seed_hash = derive_seed_hash(self.video_frame_no, self.salt)
                 
-                # Encrypt frame data
-                ciphertext, metadata = encrypt_data(
+                # Encrypt frame data using VIDEO pipeline (2D spatial)
+                ciphertext, metadata = encrypt_video_data(
                     frame_bytes, self.pool_bytes, seed_hash, 
-                    self.block_size, self.rounds
+                    self.video_frame_no, frame_rgb.shape
                 )
                 
                 # Add frame metadata (dimensions, frame_no)
-                frame_metadata = (struct.pack('>III', frame.shape[1], frame.shape[0], self.video_frame_no) + 
+                frame_metadata = (struct.pack('>III', frame_rgb.shape[1], frame_rgb.shape[0], self.video_frame_no) + 
                                 metadata)
                 
                 # Compute HMAC
@@ -187,6 +218,7 @@ class MasterSystem:
             try:
                 # Read audio data
                 audio_data = stream.read(chunk_size, exception_on_overflow=False)
+                audio_frame = np.frombuffer(audio_data, dtype=np.int16)
                 
                 # Save original audio sample
                 self.save_audio_sample(audio_data, self.audio_frame_no)
@@ -194,11 +226,15 @@ class MasterSystem:
                 # Generate seed for this audio packet
                 seed_hash = derive_seed_hash(self.audio_frame_no, self.salt)
                 
-                # Encrypt audio data
-                ciphertext, metadata = encrypt_data(
-                    audio_data, self.pool_bytes, seed_hash,
-                    self.block_size, self.rounds  
+                # Encrypt using AUDIO pipeline (1D temporal)
+                ciphertext, audio_metadata = encrypt_audio_data(
+                    audio_frame, self.pool_bytes, seed_hash,
+                    self.audio_frame_no, self.audio_last_state
                 )
+                
+                # Update audio state
+                state_len = struct.unpack('>I', audio_metadata[8:12])[0]
+                self.audio_last_state = audio_metadata[12:12+state_len] if state_len > 0 else None
                 
                 # Save encrypted audio sample
                 if self.audio_frame_no in [1, 3, 5]:
@@ -206,9 +242,6 @@ class MasterSystem:
                     with open(filename, 'wb') as f:
                         f.write(ciphertext)
                     print(f"Saved encrypted audio sample {self.audio_frame_no}")
-                
-                # Add audio metadata (frame_no)
-                audio_metadata = struct.pack('>I', self.audio_frame_no) + metadata
                 
                 # Compute HMAC
                 tag = compute_hmac(audio_metadata, ciphertext, self.salt)
@@ -235,6 +268,7 @@ class MasterSystem:
             
             # Keep main thread alive
             print("Master system running. Press Ctrl+C to stop.")
+            print("Original video display in 'Master - Original Video' window.")
             while self.running:
                 time.sleep(1)
                 
@@ -257,6 +291,8 @@ class MasterSystem:
         if self.audio:
             self.audio.terminate()
             
+        cv2.destroyAllWindows()
+        
         print("Master system stopped")
 
 

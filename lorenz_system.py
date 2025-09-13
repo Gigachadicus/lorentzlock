@@ -1,6 +1,8 @@
+# lorenz_system.py
 import numpy as np
 from scipy.integrate import solve_ivp
-from lorenz_cipher import quantize_lorenz_state
+import hashlib
+import struct
 
 
 class LorenzParameters:
@@ -44,6 +46,24 @@ class LorenzSystem:
         return self.state_history
 
 
+def quantize_lorenz_state(state: np.ndarray, bits: int = 32) -> int:
+    """Quantize Lorenz state to integer for deterministic operations"""
+    x, y, z = state
+    # Normalize to [0, 1] range using known Lorenz bounds
+    x_norm = (x + 30) / 60  # Lorenz x typically in [-30, 30]
+    y_norm = (y + 30) / 60  # Lorenz y typically in [-30, 30] 
+    z_norm = z / 60         # Lorenz z typically in [0, 60]
+    
+    # Clamp to [0, 1]
+    x_norm = max(0, min(1, x_norm))
+    y_norm = max(0, min(1, y_norm))
+    z_norm = max(0, min(1, z_norm))
+    
+    # Convert to integer
+    max_val = (1 << bits) - 1
+    return int((x_norm + y_norm + z_norm) / 3 * max_val)
+
+
 def generate_pool_bytes(size_mb: int = 10) -> bytes:
     """Generate Lorenz pool bytes in memory"""
     print(f"Generating {size_mb}MB pool in memory...")
@@ -55,7 +75,7 @@ def generate_pool_bytes(size_mb: int = 10) -> bytes:
     pool_size_bytes = size_mb * 1024 * 1024
     bytes_per_step = 4
     total_steps = pool_size_bytes // bytes_per_step
-    steps_per_batch = 5000  # Reduced batch size for better progress
+    steps_per_batch = 5000
     
     pool_data = bytearray()
     
