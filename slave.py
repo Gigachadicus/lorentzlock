@@ -9,6 +9,7 @@ import pyaudio
 from lorenz_cipher import (
     load_pool_bytes, derive_seed_hash, decrypt_data, verify_hmac
 )
+from lorenz_system import generate_pool_bytes
 
 
 class SlaveSystem:
@@ -16,7 +17,13 @@ class SlaveSystem:
         self.args = args
         self.host = args.host
         self.port = args.port
-        self.pool_bytes = load_pool_bytes(args.pool_file)
+        
+        # Load or generate pool bytes
+        if args.pool_file:
+            self.pool_bytes = load_pool_bytes(args.pool_file)
+        else:
+            self.pool_bytes = generate_pool_bytes(args.pool_size_mb)
+        
         self.salt = args.salt.encode()
         self.block_size = args.block_size
         self.rounds = args.rounds
@@ -226,7 +233,8 @@ def main():
     parser = argparse.ArgumentParser(description='Lorenz Cipher Slave System')
     parser.add_argument('--host', default='127.0.0.1', help='Master host address')
     parser.add_argument('--port', type=int, default=5000, help='Master UDP port')
-    parser.add_argument('--pool-file', required=True, help='Path to Lorenz pool bytes file')
+    parser.add_argument('--pool-file', help='Path to Lorenz pool bytes file (optional)')
+    parser.add_argument('--pool-size-mb', type=int, default=10, help='Pool size in MB if generating (default: 10)')
     parser.add_argument('--salt', required=True, help='HMAC salt string (must match master)')
     parser.add_argument('--block-size', type=int, default=768, help='Encryption block size')
     parser.add_argument('--rounds', type=int, default=3, help='Number of encryption rounds')
