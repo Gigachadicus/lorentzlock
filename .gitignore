@@ -1,0 +1,6 @@
+# Ignore Python bytecode cache
+__pycache__/
+*.py[cod]
+
+# Ignore .bin files
+*.bin
