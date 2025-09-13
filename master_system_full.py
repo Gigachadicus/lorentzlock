@@ -188,6 +188,9 @@ class MasterSystem:
                 # Read audio data
                 audio_data = stream.read(chunk_size, exception_on_overflow=False)
                 
+                # Save original audio sample
+                self.save_audio_sample(audio_data, self.audio_frame_no)
+                
                 # Generate seed for this audio packet
                 seed_hash = derive_seed_hash(self.audio_frame_no, self.salt)
                 
@@ -196,6 +199,13 @@ class MasterSystem:
                     audio_data, self.pool_bytes, seed_hash,
                     self.block_size, self.rounds  
                 )
+                
+                # Save encrypted audio sample
+                if self.audio_frame_no in [1, 3, 5]:
+                    filename = f'samples/audio/audio_{self.audio_frame_no}_encrypted.bin'
+                    with open(filename, 'wb') as f:
+                        f.write(ciphertext)
+                    print(f"Saved encrypted audio sample {self.audio_frame_no}")
                 
                 # Add audio metadata (frame_no)
                 audio_metadata = struct.pack('>I', self.audio_frame_no) + metadata

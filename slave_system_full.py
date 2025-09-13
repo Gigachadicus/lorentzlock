@@ -145,6 +145,9 @@ class SlaveSystem:
                 seed_hash, self.block_size, self.rounds
             )
             
+            # Save decrypted audio sample
+            self.save_decrypted_audio_sample(audio_bytes, frame_no)
+            
             # Play audio
             if self.audio_stream:
                 self.audio_stream.write(audio_bytes)
