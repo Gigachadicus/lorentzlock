@@ -55,9 +55,11 @@ def generate_pool_bytes(size_mb: int = 10) -> bytes:
     pool_size_bytes = size_mb * 1024 * 1024
     bytes_per_step = 4
     total_steps = pool_size_bytes // bytes_per_step
-    steps_per_batch = 10000
+    steps_per_batch = 5000  # Reduced batch size for better progress
     
     pool_data = bytearray()
+    
+    print(f"Total steps needed: {total_steps}")
     
     for batch in range(0, total_steps, steps_per_batch):
         current_batch_size = min(steps_per_batch, total_steps - batch)
@@ -69,6 +71,10 @@ def generate_pool_bytes(size_mb: int = 10) -> bytes:
         for state in trajectory:
             quantized = quantize_lorenz_state(state, bits=32)
             pool_data.extend(quantized.to_bytes(4, 'big'))
+        
+        # Progress update
+        progress = (batch + current_batch_size) / total_steps * 100
+        print(f"Progress: {progress:.1f}% ({len(pool_data)} bytes generated)")
     
     print(f"Generated {len(pool_data)} bytes of Lorenz pool data")
     return bytes(pool_data)

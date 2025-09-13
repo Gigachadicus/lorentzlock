@@ -237,7 +237,7 @@ def main():
     parser.add_argument('--host', default='127.0.0.1', help='Master host address')
     parser.add_argument('--port', type=int, default=5000, help='Master UDP port')
     parser.add_argument('--pool-file', help='Path to Lorenz pool bytes file (optional)')
-    parser.add_argument('--pool-size-mb', type=int, default=10, help='Pool size in MB if generating (default: 10)')
+    parser.add_argument('--pool-size-mb', type=int, default=1, help='Pool size in MB if generating (default: 1)')
     parser.add_argument('--salt', required=True, help='HMAC salt string (must match master)')
     parser.add_argument('--block-size', type=int, default=768, help='Encryption block size')
     parser.add_argument('--rounds', type=int, default=3, help='Number of encryption rounds')
