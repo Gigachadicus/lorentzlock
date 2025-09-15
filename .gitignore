@@ -7,3 +7,9 @@ __pycache__/
 
 #Ignore samples
 samples/
+
+#master data
+master_data/
+
+#slave data
+slave_data/
